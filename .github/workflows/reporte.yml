@@ -1,0 +1,64 @@
+name: Generar Reporte CSV de Ventas
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+env:
+  ACCEPT_EULA: Y
+  MSSQL_PID: Developer
+  SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+
+jobs:
+  export-csv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Iniciar contenedor SQL Server
+        run: |
+          docker run -e "ACCEPT_EULA=$ACCEPT_EULA" \
+                     -e "MSSQL_PID=$MSSQL_PID" \
+                     -e "MSSQL_SA_PASSWORD=$SA_PASSWORD" \
+                     -p 1433:1433 \
+                     --name sqlserver_report \
+                     -d mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: 3. Esperar disponibilidad de SQL Server
+        run: |
+          for i in {1..30}; do
+            if docker exec sqlserver_report /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -Q "SELECT 1" &> /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+      - name: 4. Inicializar BD y poblar datos
+        run: |
+          docker cp ./sql sqlserver_report:/sql
+          SQLCMD="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $SA_PASSWORD -C"
+          docker exec sqlserver_report $SQLCMD -i /sql/create_database.sql
+          docker exec sqlserver_report $SQLCMD -i /sql/create_tables.sql
+          docker exec sqlserver_report $SQLCMD -i /sql/create_procedure.sql
+          docker exec sqlserver_report $SQLCMD -i /sql/create_trigger.sql
+          docker exec sqlserver_report $SQLCMD -i /sql/test_data.sql
+
+      - name: 5. Exportar consulta a archivo CSV
+        run: |
+          echo "VentaID,Producto,CantidadVendida,StockRestante,FechaVenta,MensajeAuditoria" > reporte_ventas.csv
+          docker exec sqlserver_report /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P "$SA_PASSWORD" -C \
+            -d EmpresaDB \
+            -Q "SET NOCOUNT ON; SELECT v.VentaID, v.Producto, v.Cantidad, i.Existencias, CONVERT(VARCHAR(19), v.Fecha, 120), a.Mensaje FROM Ventas v INNER JOIN Inventario i ON v.Producto = i.Producto INNER JOIN AuditoriaVentas a ON v.VentaID = a.VentaID;" \
+            -s "," -W -h -1 >> reporte_ventas.csv
+          cat reporte_ventas.csv
+
+      - name: 6. Publicar CSV como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-ventas-csv
+          path: reporte_ventas.csv
+          retention-days: 7
